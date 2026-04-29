@@ -212,6 +212,102 @@ class TestParseArgs(unittest.TestCase):
         args = parse_args(["--days-ahead", "10", "--samples", "20"])
         self.assertEqual(args.samples, 20)
 
+    def test_model_default_is_poly(self):
+        from predict_accuracy import parse_args
+        args = parse_args(["--days-ahead", "10"])
+        self.assertEqual(args.model, "poly")
+
+    def test_model_var(self):
+        from predict_accuracy import parse_args
+        args = parse_args(["--days-ahead", "10", "--model", "var"])
+        self.assertEqual(args.model, "var")
+
+    def test_lags_default_is_none(self):
+        from predict_accuracy import parse_args
+        args = parse_args(["--days-ahead", "10"])
+        self.assertIsNone(args.lags)
+
+    def test_lags_override(self):
+        from predict_accuracy import parse_args
+        args = parse_args(["--days-ahead", "10", "--model", "var", "--lags", "3"])
+        self.assertEqual(args.lags, 3)
+
+    def test_invalid_model_exits(self):
+        from predict_accuracy import parse_args
+        with self.assertRaises(SystemExit):
+            parse_args(["--days-ahead", "10", "--model", "bad"])
+
+
+# ---------------------------------------------------------------------------
+# Tests for walk_forward_accuracy_var
+# ---------------------------------------------------------------------------
+
+class TestWalkForwardAccuracyVar(unittest.TestCase):
+
+    def setUp(self):
+        self.df_all = _make_price_df("ALL")
+        # Use a distinct seed so the two series are not perfectly collinear
+        rng = np.random.default_rng(99)
+        dates = pd.bdate_range(start="2020-01-02", periods=252 * 5)
+        prices = 3000 * np.cumprod(1 + rng.normal(0.0002, 0.012, size=252 * 5))
+        self.df_sp500 = pd.DataFrame({"^GSPC": prices}, index=dates)
+
+    def test_returns_dataframe(self):
+        from predict_accuracy import walk_forward_accuracy_var
+        result = walk_forward_accuracy_var(
+            self.df_all, self.df_sp500, days_ahead=30, maxlags=2, n_samples=5
+        )
+        self.assertIsInstance(result, pd.DataFrame)
+
+    def test_expected_columns(self):
+        from predict_accuracy import walk_forward_accuracy_var
+        result = walk_forward_accuracy_var(
+            self.df_all, self.df_sp500, days_ahead=30, maxlags=2, n_samples=5
+        )
+        for col in ("sample_date", "predict_date", "predicted", "actual", "error", "error_pct"):
+            self.assertIn(col, result.columns, msg=f"missing column: {col}")
+
+    def test_sample_count_positive(self):
+        from predict_accuracy import walk_forward_accuracy_var
+        result = walk_forward_accuracy_var(
+            self.df_all, self.df_sp500, days_ahead=30, maxlags=2, n_samples=5
+        )
+        self.assertGreater(len(result), 0)
+
+    def test_sample_count_at_most_n_samples(self):
+        from predict_accuracy import walk_forward_accuracy_var
+        result = walk_forward_accuracy_var(
+            self.df_all, self.df_sp500, days_ahead=30, maxlags=2, n_samples=10
+        )
+        self.assertLessEqual(len(result), 10)
+
+    def test_predict_date_after_sample_date(self):
+        from predict_accuracy import walk_forward_accuracy_var
+        result = walk_forward_accuracy_var(
+            self.df_all, self.df_sp500, days_ahead=30, maxlags=2, n_samples=5
+        )
+        for _, row in result.iterrows():
+            self.assertGreater(row["predict_date"], row["sample_date"])
+
+    def test_error_equals_predicted_minus_actual(self):
+        from predict_accuracy import walk_forward_accuracy_var
+        result = walk_forward_accuracy_var(
+            self.df_all, self.df_sp500, days_ahead=30, maxlags=2, n_samples=5
+        )
+        for _, row in result.iterrows():
+            self.assertAlmostEqual(
+                row["error"], round(row["predicted"] - row["actual"], 2), places=1
+            )
+
+    def test_insufficient_data_raises(self):
+        from predict_accuracy import walk_forward_accuracy_var
+        tiny_all = self.df_all.iloc[:10]
+        tiny_sp500 = self.df_sp500.iloc[:10]
+        with self.assertRaises(ValueError):
+            walk_forward_accuracy_var(
+                tiny_all, tiny_sp500, days_ahead=30, maxlags=2, n_samples=5
+            )
+
 
 # ---------------------------------------------------------------------------
 # Tests for main()
@@ -220,9 +316,13 @@ class TestParseArgs(unittest.TestCase):
 class TestMain(unittest.TestCase):
 
     def _make_raw(self, ticker, **_kwargs):
-        df = _make_price_df(ticker)
-        df.columns = pd.Index(["Close"])
-        return df
+        seed = 42 if "ALL" in str(ticker) else 99
+        rng = np.random.default_rng(seed)
+        n_days = 252 * 5
+        dates = pd.bdate_range(start="2020-01-02", periods=n_days)
+        start_price = 100 if "ALL" in str(ticker) else 3000
+        prices = start_price * np.cumprod(1 + rng.normal(0.0003, 0.015, size=n_days))
+        return pd.DataFrame({"Close": prices}, index=dates)
 
     @patch("app.yf.download")
     def test_main_returns_results_for_all_tickers(self, mock_dl):
@@ -272,6 +372,22 @@ class TestMain(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             main(["--days-ahead", "30", "--samples", "5"])
         self.assertEqual(ctx.exception.code, 1)
+
+    @patch("app.yf.download")
+    def test_main_var_returns_all(self, mock_dl):
+        mock_dl.side_effect = self._make_raw
+        from predict_accuracy import main
+        results = main(["--days-ahead", "30", "--model", "var", "--lags", "2", "--samples", "5"])
+        self.assertIn("ALL", results)
+        self.assertNotIn("^GSPC", results)
+
+    @patch("app.yf.download")
+    def test_main_var_result_has_samples_and_metrics(self, mock_dl):
+        mock_dl.side_effect = self._make_raw
+        from predict_accuracy import main
+        results = main(["--days-ahead", "30", "--model", "var", "--lags", "2", "--samples", "5"])
+        self.assertIn("samples", results["ALL"])
+        self.assertIn("metrics", results["ALL"])
 
 
 if __name__ == "__main__":

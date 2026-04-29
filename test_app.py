@@ -152,6 +152,31 @@ class TestParseArgs(unittest.TestCase):
         args = parse_args([])
         self.assertEqual(args.output, "price_prediction.png")
 
+    def test_model_default_is_poly(self):
+        from app import parse_args
+        args = parse_args([])
+        self.assertEqual(args.model, "poly")
+
+    def test_model_var(self):
+        from app import parse_args
+        args = parse_args(["--model", "var"])
+        self.assertEqual(args.model, "var")
+
+    def test_lags_default_is_none(self):
+        from app import parse_args
+        args = parse_args([])
+        self.assertIsNone(args.lags)
+
+    def test_lags_override(self):
+        from app import parse_args
+        args = parse_args(["--model", "var", "--lags", "5"])
+        self.assertEqual(args.lags, 5)
+
+    def test_invalid_model_exits(self):
+        from app import parse_args
+        with self.assertRaises(SystemExit):
+            parse_args(["--model", "not_a_model"])
+
 
 class TestMainWithMockedData(unittest.TestCase):
     """End-to-end test of main() with mocked yfinance and matplotlib."""
@@ -186,6 +211,127 @@ class TestMainWithMockedData(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             main(["--date", "not-a-date"])
         self.assertEqual(ctx.exception.code, 1)
+
+
+class TestBuildVarModel(unittest.TestCase):
+    """build_var_model should fit a VAR and return a metrics dict."""
+
+    def setUp(self):
+        self.df_all = _make_price_df("ALL")
+        # Use a distinct seed so ALL and ^GSPC are not perfectly collinear
+        rng = np.random.default_rng(99)
+        dates = pd.bdate_range(start="2020-01-02", periods=252 * 5)
+        prices = 3000 * np.cumprod(1 + rng.normal(0.0002, 0.012, size=252 * 5))
+        self.df_sp500 = pd.DataFrame({"^GSPC": prices}, index=dates)
+
+    def test_returns_three_items(self):
+        from app import build_var_model
+        result = build_var_model(self.df_all, self.df_sp500, maxlags=3)
+        self.assertEqual(len(result), 3)  # var_result, combined, metrics
+
+    def test_combined_has_expected_columns(self):
+        from app import build_var_model
+        _, combined, _ = build_var_model(self.df_all, self.df_sp500, maxlags=3)
+        self.assertIn("ALL", combined.columns)
+        self.assertIn("GSPC", combined.columns)
+
+    def test_metrics_keys(self):
+        from app import build_var_model
+        _, _, metrics = build_var_model(self.df_all, self.df_sp500, maxlags=3)
+        for key in ("aic", "bic", "hqic", "lags", "mae", "r2"):
+            self.assertIn(key, metrics, msg=f"missing key: {key}")
+
+    def test_metrics_lags_positive(self):
+        from app import build_var_model
+        _, _, metrics = build_var_model(self.df_all, self.df_sp500, maxlags=3)
+        self.assertGreaterEqual(metrics["lags"], 1)
+
+    def test_metrics_mae_positive(self):
+        from app import build_var_model
+        _, _, metrics = build_var_model(self.df_all, self.df_sp500, maxlags=3)
+        self.assertGreater(metrics["mae"], 0)
+
+    def test_combined_no_nan(self):
+        from app import build_var_model
+        _, combined, _ = build_var_model(self.df_all, self.df_sp500, maxlags=3)
+        self.assertFalse(combined.isnull().any().any())
+
+
+class TestPredictVarPrice(unittest.TestCase):
+    """predict_var_price should return a positive float."""
+
+    def setUp(self):
+        from app import build_var_model
+        df_all = _make_price_df("ALL")
+        rng = np.random.default_rng(99)
+        dates = pd.bdate_range(start="2020-01-02", periods=252 * 5)
+        prices = 3000 * np.cumprod(1 + rng.normal(0.0002, 0.012, size=252 * 5))
+        df_sp500 = pd.DataFrame({"^GSPC": prices}, index=dates)
+        self.var_result, self.combined, _ = build_var_model(df_all, df_sp500, maxlags=2)
+
+    def test_returns_float(self):
+        from app import predict_var_price
+        target = self.combined.index[-1].to_pydatetime()
+        from datetime import timedelta
+        target = target + timedelta(days=365)
+        result = predict_var_price(self.var_result, self.combined, target)
+        self.assertIsInstance(result, float)
+
+    def test_prediction_positive(self):
+        from app import predict_var_price
+        from datetime import timedelta
+        target = self.combined.index[-1].to_pydatetime() + timedelta(days=180)
+        result = predict_var_price(self.var_result, self.combined, target)
+        self.assertGreater(result, 0)
+
+    def test_past_date_returns_last_price(self):
+        from app import predict_var_price
+        past_date = self.combined.index[0].to_pydatetime()
+        result = predict_var_price(self.var_result, self.combined, past_date)
+        self.assertAlmostEqual(result, float(self.combined["ALL"].iloc[-1]), places=5)
+
+
+class TestMainVarModel(unittest.TestCase):
+    """End-to-end tests of main() with --model var."""
+
+    def _make_raw(self, ticker, **_kwargs):
+        seed = 42 if "ALL" in str(ticker) else 99
+        rng = np.random.default_rng(seed)
+        n_days = 252 * 5
+        dates = pd.bdate_range(start="2020-01-02", periods=n_days)
+        start_price = 100 if "ALL" in str(ticker) else 3000
+        prices = start_price * np.cumprod(1 + rng.normal(0.0003, 0.015, size=n_days))
+        df = pd.DataFrame({"Close": prices}, index=dates)
+        return df
+
+    @patch("app.plt.savefig")
+    @patch("app.plt.tight_layout")
+    @patch("app.yf.download")
+    def test_var_main_returns_all(self, mock_dl, _mock_tight, _mock_save):
+        mock_dl.side_effect = self._make_raw
+        from app import main
+        results = main(["--date", "2026-12-31", "--model", "var", "--lags", "2"])
+        self.assertIn("ALL", results)
+        self.assertNotIn("^GSPC", results)
+
+    @patch("app.plt.savefig")
+    @patch("app.plt.tight_layout")
+    @patch("app.yf.download")
+    def test_var_main_prediction_positive(self, mock_dl, _mock_tight, _mock_save):
+        mock_dl.side_effect = self._make_raw
+        from app import main
+        results = main(["--date", "2026-12-31", "--model", "var", "--lags", "2"])
+        self.assertGreater(results["ALL"]["prediction"], 0)
+
+    @patch("app.plt.savefig")
+    @patch("app.plt.tight_layout")
+    @patch("app.yf.download")
+    def test_var_main_metrics_present(self, mock_dl, _mock_tight, _mock_save):
+        mock_dl.side_effect = self._make_raw
+        from app import main
+        results = main(["--date", "2026-12-31", "--model", "var", "--lags", "2"])
+        self.assertIn("aic", results["ALL"]["metrics"])
+        self.assertIn("lags", results["ALL"]["metrics"])
 
 
 if __name__ == "__main__":

@@ -3,18 +3,26 @@
 Prediction Accuracy Script
 ===========================
 Walks forward through historical closing-price data to measure how well the
-polynomial regression model predicts prices *N* trading days in the future.
+chosen model predicts prices *N* trading days in the future.
 
 For each sample point the model is trained on all data up to that point,
 then used to predict the price ``--days-ahead`` trading days later.  The
 predicted value is compared to the actual closing price recorded in the
 dataset, and per-sample errors plus aggregate metrics are reported.
 
+Models
+------
+  poly  Polynomial regression walk-forward (default).
+  var   Vector AutoRegression walk-forward using both ALL and ^GSPC;
+        predicts ALL price only.
+
 Usage
 -----
     python predict_accuracy.py --days-ahead 30
     python predict_accuracy.py --days-ahead 90 --ticker ALL --degree 3
     python predict_accuracy.py --days-ahead 60 --samples 50
+    python predict_accuracy.py --days-ahead 30 --model var
+    python predict_accuracy.py --days-ahead 30 --model var --lags 5
 """
 
 import argparse
@@ -23,7 +31,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from app import build_model, fetch_data, predict_price
+from app import build_model, build_var_model, fetch_data, predict_price, predict_var_price
 
 # ---------------------------------------------------------------------------
 # Tickers (mirrors app.py)
@@ -124,6 +132,111 @@ def walk_forward_accuracy(
 
 
 # ---------------------------------------------------------------------------
+# VAR walk-forward backtest
+# ---------------------------------------------------------------------------
+
+
+def walk_forward_accuracy_var(
+    df_all: pd.DataFrame,
+    df_sp500: pd.DataFrame,
+    days_ahead: int,
+    maxlags: int = 10,
+    n_samples: int = 50,
+) -> pd.DataFrame:
+    """Perform a walk-forward backtest using the VAR model and return per-sample results.
+
+    Both ALL and ^GSPC series are used to train the VAR model at each step.
+    The model predicts the ALL closing price ``days_ahead`` trading days ahead,
+    and the prediction is compared to the actual closing price in the dataset.
+
+    Parameters
+    ----------
+    df_all:
+        Single-column DataFrame with column ``'ALL'`` and a DatetimeIndex.
+    df_sp500:
+        Single-column DataFrame with column ``'^GSPC'`` and a DatetimeIndex.
+    days_ahead:
+        Number of trading days ahead to predict.
+    maxlags:
+        Upper bound on VAR lag-order selection (AIC).
+    n_samples:
+        Maximum number of walk-forward sample points to evaluate.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``sample_date``, ``predict_date``, ``predicted``, ``actual``,
+        ``error``, ``error_pct``.
+
+    Raises
+    ------
+    ValueError
+        If the aligned dataset does not contain enough rows.
+    """
+    # Align on shared trading days
+    combined = pd.concat(
+        [df_all["ALL"].rename("ALL"), df_sp500["^GSPC"].rename("GSPC")],
+        axis=1,
+    ).dropna()
+
+    n = len(combined)
+    # Need enough rows to fit VAR (at least maxlags + some training buffer)
+    min_train = max(maxlags + 10, 50)
+    max_sample_idx = n - days_ahead - 1
+
+    if max_sample_idx < min_train:
+        raise ValueError(
+            f"Not enough data for a {days_ahead}-day-ahead VAR backtest: "
+            f"need at least {min_train + days_ahead + 1} aligned rows, got {n}."
+        )
+
+    raw_indices = np.linspace(min_train, max_sample_idx, n_samples, dtype=int)
+    _, unique_pos = np.unique(raw_indices, return_index=True)
+    sample_indices = raw_indices[np.sort(unique_pos)]
+
+    rows = []
+    for idx in sample_indices:
+        train_combined = combined.iloc[: idx + 1]
+        train_all = train_combined[["ALL"]].rename(columns={"ALL": "ALL"})
+        train_sp500 = train_combined[["GSPC"]].rename(columns={"GSPC": "^GSPC"})
+
+        try:
+            var_result, combined_fit, _ = build_var_model(
+                train_all, train_sp500, maxlags=maxlags
+            )
+        except Exception:
+            continue
+
+        target_idx = idx + days_ahead
+        target_date = combined.index[target_idx].to_pydatetime()
+
+        predicted = predict_var_price(var_result, combined_fit, target_date)
+        actual = float(combined["ALL"].iloc[target_idx])
+
+        error = predicted - actual
+        error_pct = (error / actual * 100.0) if actual != 0 else float("nan")
+
+        rows.append(
+            {
+                "sample_date": combined.index[idx].date(),
+                "predict_date": combined.index[target_idx].date(),
+                "predicted": round(predicted, 2),
+                "actual": round(actual, 2),
+                "error": round(error, 2),
+                "error_pct": round(error_pct, 4),
+            }
+        )
+
+    if not rows:
+        raise ValueError(
+            "No walk-forward samples could be computed for the VAR model. "
+            "Try reducing --days-ahead or --lags."
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -199,7 +312,10 @@ def parse_args(argv=None):
         description=(
             "Walk-forward backtest: train on data up to each sample point "
             "and predict --days-ahead trading days forward, then compare "
-            "to the actual closing price and report accuracy metrics."
+            "to the actual closing price and report accuracy metrics.\n\n"
+            "Models:\n"
+            "  poly  Polynomial regression (default)\n"
+            "  var   Vector AutoRegression using ALL and ^GSPC jointly"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -211,12 +327,21 @@ def parse_args(argv=None):
         help="Number of trading days ahead to predict (required).",
     )
     parser.add_argument(
+        "--model",
+        choices=["poly", "var"],
+        default="poly",
+        help=(
+            "Forecasting model: 'poly' (polynomial regression, default) "
+            "or 'var' (Vector AutoRegression using ALL and ^GSPC jointly)"
+        ),
+    )
+    parser.add_argument(
         "--ticker",
         default=None,
         metavar="SYMBOL",
         help=(
-            "Restrict evaluation to a single ticker symbol "
-            "(default: all — ALL and ^GSPC).  Example: --ticker ALL"
+            "Restrict evaluation to a single ticker symbol for the 'poly' model "
+            "(default: all — ALL and ^GSPC).  Ignored when --model var is used."
         ),
     )
     parser.add_argument(
@@ -224,7 +349,17 @@ def parse_args(argv=None):
         type=int,
         default=2,
         metavar="N",
-        help="Polynomial degree for the regression model (default: 2).",
+        help="Polynomial degree for the 'poly' model (default: 2).",
+    )
+    parser.add_argument(
+        "--lags",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum lag order for AIC selection in the 'var' model (default: 10). "
+            "Pass the exact desired lag count to skip selection."
+        ),
     )
     parser.add_argument(
         "--samples",
@@ -246,45 +381,88 @@ def main(argv=None):
         print("Error: --samples must be at least 1.", file=sys.stderr)
         sys.exit(1)
 
-    tickers = TICKERS
-    if args.ticker:
-        if args.ticker not in TICKERS:
-            print(
-                f"Error: unknown ticker '{args.ticker}'. "
-                f"Choose from: {', '.join(TICKERS)}.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        tickers = {args.ticker: TICKERS[args.ticker]}
-
     print(f"\nDays ahead  : {args.days_ahead}")
-    print(f"Poly degree : {args.degree}")
+    print(f"Model       : {args.model}")
+    if args.model == "poly":
+        print(f"Poly degree : {args.degree}")
+    else:
+        maxlags = args.lags if args.lags is not None else 10
+        print(f"VAR max lags: {maxlags}")
     print(f"Samples     : {args.samples}")
     print()
 
     all_results = {}
-    for ticker, name in tickers.items():
+
+    if args.model == "var":
+        # VAR always uses both ALL and ^GSPC
+        if args.ticker is not None:
+            print(
+                "Note: --ticker is ignored for --model var "
+                "(VAR always uses ALL and ^GSPC jointly).",
+                file=sys.stderr,
+            )
+        maxlags = args.lags if args.lags is not None else 10
         try:
-            print(f"Fetching data for {ticker}…")
-            df = fetch_data(ticker)
+            print("Fetching data for ALL…")
+            df_all = fetch_data("ALL")
+            print("Fetching data for ^GSPC…")
+            df_sp500 = fetch_data("^GSPC")
         except ValueError as exc:
             print(f"  Warning: {exc}", file=sys.stderr)
-            continue
+            print("Error: no results could be computed.", file=sys.stderr)
+            sys.exit(1)
 
         try:
-            df_results = walk_forward_accuracy(
-                df,
-                ticker,
+            df_results = walk_forward_accuracy_var(
+                df_all,
+                df_sp500,
                 days_ahead=args.days_ahead,
-                degree=args.degree,
+                maxlags=maxlags,
                 n_samples=args.samples,
             )
         except ValueError as exc:
             print(f"  Warning: {exc}", file=sys.stderr)
-            continue
+            print("Error: no results could be computed.", file=sys.stderr)
+            sys.exit(1)
 
-        metrics = print_report(df_results, ticker, name, args.days_ahead)
-        all_results[ticker] = {"samples": df_results, "metrics": metrics}
+        metrics = print_report(df_results, "ALL", TICKERS["ALL"], args.days_ahead)
+        all_results["ALL"] = {"samples": df_results, "metrics": metrics}
+
+    else:
+        # Polynomial model (existing behaviour)
+        tickers = TICKERS
+        if args.ticker:
+            if args.ticker not in TICKERS:
+                print(
+                    f"Error: unknown ticker '{args.ticker}'. "
+                    f"Choose from: {', '.join(TICKERS)}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            tickers = {args.ticker: TICKERS[args.ticker]}
+
+        for ticker, name in tickers.items():
+            try:
+                print(f"Fetching data for {ticker}…")
+                df = fetch_data(ticker)
+            except ValueError as exc:
+                print(f"  Warning: {exc}", file=sys.stderr)
+                continue
+
+            try:
+                df_results = walk_forward_accuracy(
+                    df,
+                    ticker,
+                    days_ahead=args.days_ahead,
+                    degree=args.degree,
+                    n_samples=args.samples,
+                )
+            except ValueError as exc:
+                print(f"  Warning: {exc}", file=sys.stderr)
+                continue
+
+            metrics = print_report(df_results, ticker, name, args.days_ahead)
+            all_results[ticker] = {"samples": df_results, "metrics": metrics}
 
     if not all_results:
         print("Error: no results could be computed.", file=sys.stderr)
